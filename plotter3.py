@@ -2,6 +2,7 @@
 # Run:
 #   pip install streamlit pandas openpyxl numpy matplotlib scipy
 #   streamlit run app.py
+from __future__ import annotations
 
 import io
 import os
@@ -39,16 +40,6 @@ def nice_label(colname: str) -> str:
     if n:
         return f"pa={n.group(1)}"
     return s
-
-
-def sort_key(lbl: str) -> Tuple[float, float]:
-    if lbl.lower() == "baseline":
-        return (float("-inf"), float("-inf"))
-    m = re.search(r"pr=([-+]?\d*\.?\d+)", lbl)
-    n = re.search(r"pa=([-+]?\d*\.?\d+)", lbl)
-    pr = float(m.group(1)) if m else float("inf")
-    pa = float(n.group(1)) if n else float("inf")
-    return (pr, pa)
 
 
 def hdr_prob_to_level(Z: np.ndarray, dx: float, dy: float, probs: Sequence[float]) -> Dict[float, float]:
@@ -166,6 +157,15 @@ def distinct_colors(n: int) -> List[str]:
 
 
 @dataclass(frozen=True)
+class PlotGroup:
+    group_id: str            # internal id
+    display: str             # label shown in legend
+    members: Tuple[str, ...] # variant_ids included
+    x: np.ndarray
+    y: np.ndarray
+
+
+@dataclass(frozen=True)
 class Variant:
     variant_id: str          # internal unique key
     display: str             # shown to user in multiselect
@@ -174,6 +174,80 @@ class Variant:
     nice: str                # nice_label(colname)
     x: np.ndarray
     y: np.ndarray
+
+
+def is_baseline(v: Variant) -> bool:
+    return str(v.nice).strip().lower() == "baseline"
+
+
+def build_groups_by_file(
+    nonbaseline: List[Variant],
+    baseline: Optional[Variant],
+) -> List[PlotGroup]:
+    """
+    Grouping mode: one group per file_label, merging all NON-baseline variants from that file.
+    Baseline (if chosen) is drawn as its own separate group.
+    """
+    buckets: Dict[str, List[Variant]] = {}
+    for v in nonbaseline:
+        buckets.setdefault(v.file_label, []).append(v)
+
+    groups: List[PlotGroup] = []
+    for file_label, vs in buckets.items():
+        x = np.concatenate([v.x for v in vs])
+        y = np.concatenate([v.y for v in vs])
+        members = tuple(v.variant_id for v in vs)
+        display = f"{file_label}"
+        groups.append(PlotGroup(group_id=f"file::{file_label}", display=display, members=members, x=x, y=y))
+
+    if baseline is not None:
+        groups.append(
+            PlotGroup(
+                group_id=f"baseline::{baseline.file_label}",
+                display=f"{baseline.file_label} — baseline",
+                members=(baseline.variant_id,),
+                x=baseline.x,
+                y=baseline.y,
+            )
+        )
+
+    groups.sort(key=lambda g: g.group_id.lower())
+    return groups
+
+
+def build_groups_no_grouping(
+    nonbaseline: List[Variant],
+    baseline: Optional[Variant],
+) -> List[PlotGroup]:
+    """
+    No grouping: each selected NON-baseline variant is its own group.
+    Baseline (if chosen) is drawn as its own separate group.
+    """
+    groups: List[PlotGroup] = []
+    for v in nonbaseline:
+        groups.append(
+            PlotGroup(
+                group_id=f"var::{v.variant_id}",  # unique
+                display=f"{v.file_label} — {v.nice}",
+                members=(v.variant_id,),
+                x=v.x,
+                y=v.y,
+            )
+        )
+
+    if baseline is not None:
+        groups.append(
+            PlotGroup(
+                group_id=f"baseline::{baseline.file_label}",
+                display=f"{baseline.file_label} — baseline",
+                members=(baseline.variant_id,),
+                x=baseline.x,
+                y=baseline.y,
+            )
+        )
+
+    groups.sort(key=lambda g: g.group_id.lower())
+    return groups
 
 
 @st.cache_data(show_spinner=False)
@@ -215,7 +289,10 @@ def load_variants_from_bytes(
         nice = nice_label(col)
 
         variant_id = f"{file_tag}::{col}"
-        display = f"{file_label} — {nice}   (col: {col})"
+        if col == nice:
+            display = f"{nice} ({file_label})"
+        else:
+            display = f"{nice} ({file_label}) (col: {col})"
         out.append(Variant(variant_id, display, file_label, str(col), nice, x, y))
 
     if not out:
@@ -225,7 +302,7 @@ def load_variants_from_bytes(
 
 
 def make_plot(
-    variants: List[Variant],
+    groups: List[PlotGroup],
     probs: Sequence[float],
     fill_alphas: Optional[Sequence[float]],
     no_points: bool,
@@ -238,10 +315,10 @@ def make_plot(
     show_legends: bool = True,
     figsize: Tuple[float, float] = (8.4, 6.6),
 ):
-    variants_sorted = sorted(variants, key=lambda v: (sort_key(v.nice), v.file_label, v.nice))
+    groups_sorted = sorted(groups, key=lambda g: g.group_id.lower())
 
-    allx = np.concatenate([v.x for v in variants_sorted])
-    ally = np.concatenate([v.y for v in variants_sorted])
+    allx = np.concatenate([g.x for g in groups_sorted])
+    ally = np.concatenate([g.y for g in groups_sorted])
 
     xmin, xmax = float(allx.min()), float(allx.max())
     ymin, ymax = float(ally.min()), float(ally.max())
@@ -282,8 +359,8 @@ def make_plot(
 
     alpha_for_prob = {p: fill_alphas[i] for i, p in enumerate(probs_outer_to_inner)}
 
-    colors = distinct_colors(len(variants_sorted))
-    group_colors = {v.variant_id: colors[i] for i, v in enumerate(variants_sorted)}
+    colors = distinct_colors(len(groups_sorted))
+    group_colors = {g.group_id: colors[i] for i, g in enumerate(groups_sorted)}
 
     fig, ax = plt.subplots(figsize=figsize)
     ax.set_xlim(*view_xlim)
@@ -293,20 +370,20 @@ def make_plot(
     ax.set_ylabel("Twt")
 
     if not no_points:
-        for v in variants_sorted:
+        for g in groups_sorted:
             ax.scatter(
-                v.x, v.y,
+                g.x, g.y,
                 s=float(point_size),
                 alpha=float(point_alpha),
                 edgecolors="none",
-                color=group_colors[v.variant_id],
+                color=group_colors[g.group_id],
                 zorder=1,
             )
 
-    for v in variants_sorted:
-        color = group_colors[v.variant_id]
+    for g in groups_sorted:
+        color = group_colors[g.group_id]
         try:
-            kde = gaussian_kde(np.vstack([v.x, v.y]))
+            kde = gaussian_kde(np.vstack([g.x, g.y]))
             if bw_adjust != 1.0:
                 kde.set_bandwidth(bw_method=kde.factor * float(bw_adjust))
 
@@ -355,10 +432,10 @@ def make_plot(
 
     if show_legends:
         group_handles = [
-            Line2D([0], [0], color=group_colors[v.variant_id], lw=3, label=f"{v.file_label} — {v.nice}")
-            for v in variants_sorted
+            Line2D([0], [0], color=group_colors[g.group_id], lw=3, label=g.display)
+            for g in groups_sorted
         ]
-        leg_groups = ax.legend(handles=group_handles, title="Variants", loc="upper right", frameon=True)
+        leg_groups = ax.legend(handles=group_handles, title="Groups", loc="upper right", frameon=True)
         ax.add_artist(leg_groups)
 
         style_handles = [
@@ -412,8 +489,8 @@ st.title("KDE + HDR plot: select variants across multiple .xlsx files")
 
 with st.sidebar:
     st.header("Inputs")
-    sheet_data = st.text_input("Sheet for y-values", value="Data")
-    sheet_sizes = st.text_input("Sheet for x-values", value="Sizes")
+    sheet_data = st.text_input("Sheet for y-values (e.g., Data, DataTrain, DataTrueTrain, Sizes, Generation)", value="Data")
+    sheet_sizes = st.text_input("Sheet for x-values (e.g., Sizes, Generation, PopulationSizes)", value="Sizes")
     min_pairs = st.number_input("Min (x,y) pairs per variant", min_value=3, max_value=1000, value=5, step=1)
 
     st.header("KDE / HDR")
@@ -566,43 +643,6 @@ if not all_variants:
     st.error("No usable variants found in the selected files.")
     st.stop()
 
-# Variant selection (fix "select twice" by using widget key and not fighting Streamlit state)
-id_to_display = {v.variant_id: v.display for v in all_variants}
-all_ids = list(id_to_display.keys())
-
-SEL_KEY = "selected_ids"
-if SEL_KEY not in st.session_state:
-    st.session_state[SEL_KEY] = []
-
-# Reset selection to NONE when available SET changes
-available_sig = tuple(sorted(all_ids))
-if st.session_state.get("available_sig") != available_sig:
-    st.session_state["available_sig"] = available_sig
-    st.session_state[SEL_KEY] = []
-
-# Drop stale selections
-st.session_state[SEL_KEY] = [i for i in st.session_state[SEL_KEY] if i in all_ids]
-
-c1, c2, _ = st.columns([1, 1, 3])
-with c1:
-    if st.button("Select all"):
-        st.session_state[SEL_KEY] = all_ids.copy()
-        st.rerun()
-with c2:
-    if st.button("Select none"):
-        st.session_state[SEL_KEY] = []
-        st.rerun()
-
-st.multiselect(
-    "Select variants to include in the plot",
-    options=all_ids,
-    key=SEL_KEY,
-    format_func=lambda k: id_to_display.get(k, k),
-)
-
-selected_ids = st.session_state[SEL_KEY]
-selected = [v for v in all_variants if v.variant_id in set(selected_ids)]
-
 # Parse settings
 try:
     probs = parse_probs(probs_text)
@@ -615,16 +655,104 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.write(f"**Found:** {len(all_variants)} variants across {len(input_files)} input files.")
-st.write(f"**Selected:** {len(selected)} variants.")
+# ---------------------------
+# Selection UI:
+#   - Baseline chosen separately (at most 1, by construction)
+#   - Non-baseline variants selected normally
+# ---------------------------
 
-if len(selected) == 0:
-    st.warning("Select at least one variant.")
+variants_by_id = {v.variant_id: v for v in all_variants}
+id_to_display = {v.variant_id: v.display for v in all_variants}
+
+baseline_ids = [v.variant_id for v in all_variants if is_baseline(v)]
+nonbaseline_ids = [v.variant_id for v in all_variants if not is_baseline(v)]
+
+NB_KEY = "selected_nonbaseline_ids"
+BASELINE_KEY = "selected_baseline_id"
+GROUPMODE_KEY = "grouping_mode"
+
+if NB_KEY not in st.session_state:
+    st.session_state[NB_KEY] = []
+if BASELINE_KEY not in st.session_state:
+    st.session_state[BASELINE_KEY] = "(none)"
+if GROUPMODE_KEY not in st.session_state:
+    st.session_state[GROUPMODE_KEY] = "Group by file"
+
+# Reset selection when available set changes
+available_sig = (tuple(sorted(nonbaseline_ids)), tuple(sorted(baseline_ids)))
+if st.session_state.get("available_sig") != available_sig:
+    st.session_state["available_sig"] = available_sig
+    st.session_state[NB_KEY] = []
+    st.session_state[BASELINE_KEY] = "(none)"
+
+# Drop stale selections
+st.session_state[NB_KEY] = [i for i in st.session_state[NB_KEY] if i in nonbaseline_ids]
+if st.session_state[BASELINE_KEY] not in (["(none)"] + baseline_ids):
+    st.session_state[BASELINE_KEY] = "(none)"
+
+st.subheader("Grouping")
+st.radio(
+    "How to group selected variants",
+    options=["Group by file", "No grouping"],
+    key=GROUPMODE_KEY,
+    horizontal=True,
+)
+
+st.subheader("Baseline (optional)")
+if len(baseline_ids) == 0:
+    st.info("No baseline variant found in the loaded files.")
+    st.session_state[BASELINE_KEY] = "(none)"
+
+baseline_options = ["(none)"] + baseline_ids
+st.selectbox(
+    "Select the baseline variant to draw",
+    options=baseline_options,
+    key=BASELINE_KEY,
+    format_func=lambda k: "(none)" if k == "(none)" else id_to_display.get(k, k),
+)
+
+baseline_id = st.session_state[BASELINE_KEY]
+baseline_variant = None if baseline_id == "(none)" else variants_by_id[baseline_id]
+
+st.subheader("Variants to include")
+c1, c2, _ = st.columns([1, 1, 3])
+with c1:
+    if st.button("Select all"):
+        st.session_state[NB_KEY] = nonbaseline_ids.copy()
+        st.rerun()
+with c2:
+    if st.button("Select none"):
+        st.session_state[NB_KEY] = []
+        st.rerun()
+
+st.multiselect(
+    "Select variants to include in the plot (baseline is chosen above)",
+    options=nonbaseline_ids,
+    key=NB_KEY,
+    format_func=lambda k: id_to_display.get(k, k),
+)
+
+selected_nonbaseline = [variants_by_id[i] for i in st.session_state[NB_KEY]]
+
+st.write(f"**Found total:** {len(all_variants)} variants across {len(input_files)} input files.")
+st.write(f"**Selected (non-baseline):** {len(selected_nonbaseline)} variants.")
+st.write(f"**Baseline:** {'(none)' if baseline_variant is None else baseline_variant.display}")
+
+if len(selected_nonbaseline) == 0 and baseline_variant is None:
+    st.warning("Select at least one non-baseline variant or choose a baseline.")
     st.stop()
 
-# Plot
+# ---------------------------
+# Build groups based on selected mode
+# ---------------------------
+
+if st.session_state[GROUPMODE_KEY] == "Group by file":
+    groups = build_groups_by_file(nonbaseline=selected_nonbaseline, baseline=baseline_variant)
+else:
+    groups = build_groups_no_grouping(nonbaseline=selected_nonbaseline, baseline=baseline_variant)
+
 fig = make_plot(
-    variants=selected,
+    groups=groups,
     probs=probs,
     fill_alphas=fill_alphas,
     no_points=no_points,
