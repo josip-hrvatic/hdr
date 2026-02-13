@@ -407,7 +407,7 @@ def read_local_bytes(path_str: str) -> bytes:
 # Streamlit UI
 # ---------------------------
 
-st.set_page_config(page_title="KDE HDR Variant Selector", layout="wide")
+st.set_page_config(page_title="KDE HDR Variant Selector", layout="centered")
 st.title("KDE + HDR plot: select variants across multiple .xlsx files")
 
 with st.sidebar:
